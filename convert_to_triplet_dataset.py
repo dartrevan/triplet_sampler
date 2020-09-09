@@ -4,97 +4,114 @@ from sentence_transformers import models
 from argparse import ArgumentParser
 import pandas as pd
 import numpy as np
-from scipy.stats import truncnorm
-import scipy
 from tqdm import tqdm
 from mesh_hierarchy import MeSHGraph
+import os
 
-model = None
-
-def random_sample_probs(text, label, vocab):
-  sampling_vocab_size = vocab.shape[0] - vocab[vocab.label == label].shape[0]
-  probabilities = np.array([1.0/sampling_vocab_size]*vocab.shape[0])
-  probabilities[vocab.label == label] = 0.0
-  return probabilities
+from typing import Optional, Any, List
 
 
-def embedding_based_sampling(text_embedding, label, vocab):
-  distances = scipy.spatial.distance.cdist([text_embedding], vocab.embeddings.tolist(), "cosine")[0]
-  mean = np.mean(distances)
-  std = np.std(distances)
-  left_bound = np.min(distances)
-  right_bound = np.max(distances)
-  probabilities = truncnorm.pdf(distances, left_bound, right_bound, mean, std)
-  probabilities[distances == 0.0] = 0.0
-  probabilities[vocab.label == label] = 0.0
-  return probabilities/np.sum(probabilities)
+def load_model(path):
+    checkpoint_files = os.listdir(path)
+    if 'pytorch_model.bin' in checkpoint_files:
+        word_embedding_model = models.BERT(path)
+        pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(),
+                                       pooling_mode_mean_tokens=True,
+                                       pooling_mode_cls_token=False,
+                                       pooling_mode_max_tokens=False)
+        return SentenceTransformer(modules=[word_embedding_model, pooling_model])
+    return SentenceTransformer(path)
 
 
-def hard_sampling(text_embedding, label, vocab, tree):
-  top_dist, top_idx = tree.query([text_embedding], k=900)
-  probabilities = np.zeros(vocab.shape[0])
-  top_idx = [tidx for tidx in top_idx[0] if vocab.iloc[tidx].label!=label][:15]
-  top_idx =  np.random.choice(top_idx, 15, replace=False)
-  return vocab.iloc[top_idx].text.tolist()
+def get_hierarchy_aware_negatives(hierarchy: Any, label: str):
+    parents = hierarchy.get_parents(label)
+    negatives = []
+    for parent in parents:
+        children = hierarchy.get_children(parent)
+        children = [child for child in children if child !=label]
+        negatives += children
+    return negatives
 
 
-def sample_negative_examples(vocab, probs, n):
-  return np.random.choice(vocab.text, n, p=probs, replace=False)
+def find_last_occurence(ordered_labels, label):
+    for i in range(len(labels) - 1, 0, -1):
+        if ordered_labels[i][0] == label: return i
+    return 0
+
+
+def get_negative_examples(label: str, negatives_count: int, hierarchy: Optional[Any] = None,
+                          hierarchy_aware: bool = True, hard: bool = True, ordered_labels: Optional[List[str]] = None):
+
+    if hierarchy_aware:
+        subsample = get_hierarchy_aware_negatives(hierarchy, label)
+        ordered_subsample = [(concept_id, concept_name) for concept_id, concept_name in ordered_labels
+                             if concept_id in subsample and concept_id != label]
+    else:
+        last_idx = find_last_occurence(ordered_labels, label)
+        ordered_subsample = ordered_labels[last_idx + 1:]
+
+    if not hard:
+        ordered_subsample = np.random.permutation(ordered_subsample).tolist()
+    negatives = [concept_name for concept_id, concept_name in ordered_subsample[:negatives_count]]
+    return negatives
+
+
+def get_positive_examples(label: str, positives_count: int, hierarchy: Optional[Any] = None,
+                          parents_count: int = 0, hard: bool = True, ordered_labels: Optional[List[str]] = None):
+    positives = [concept_name for concept_id, concept_name in ordered_labels if concept_id == label]
+    if not hard:
+        positives = np.random.permutation(positives).tolist()
+    positives = positives[:positives_count]
+    if parents_count > 0:
+        parent_labels = hierarchy.get_parents(label)
+        parents = [concept_name for concept_id, concept_name in ordered_labels if concept_id in parent_labels]
+        if not hard:
+            parents = np.random.permutation(parents).tolist()
+    return positives + parents
 
 
 if __name__ == '__main__':
-  parser = ArgumentParser()
-  parser.add_argument('--texts')
-  parser.add_argument('--labels')
-  parser.add_argument('--vocab')
-  parser.add_argument('--hierarchy')
-  parser.add_argument('--negatives_count_per_example', type=int, default=5)
-  parser.add_argument('--positive_count_per_example', type=int, default=10)
-  parser.add_argument('--parents_sample_count', type=int, default=1)
-  parser.add_argument('--save_to')
-  parser.add_argument('--path_to_bert_model')
-  parser.add_argument('--normal', action='store_true')
-  args = parser.parse_args()
+    parser = ArgumentParser()
+    parser.add_argument('--texts')
+    parser.add_argument('--labels')
+    parser.add_argument('--vocab')
+    parser.add_argument('--hierarchy')
+    parser.add_argument('--negatives_count_per_example', type=int, default=5)
+    parser.add_argument('--positive_count_per_example', type=int, default=10)
+    parser.add_argument('--parents_sample_count', type=int, default=1)
+    parser.add_argument('--save_to')
+    parser.add_argument('--path_to_bert_model')
+    parser.add_argument('--hard', action='store_true')
+    parser.add_argument('--hierarchy_aware', action='store_true')
+    args = parser.parse_args()
 
-  texts = pd.read_csv(args.texts, names=['entity_text'], encoding='utf-8', dtype='str')
-  texts = texts.fillna('NOTEXT')
-  labels = pd.read_csv(args.labels, names=['label'], encoding='utf-8', dtype='str')
-  vocab = pd.read_csv(args.vocab, names=['label', 'text'], sep='\t', encoding='utf-8', dtype='str')
-  hierarchy = MeSHGraph(args.hierarchy)
+    texts = pd.read_csv(args.texts, names=['entity_text'], encoding='utf-8', dtype='str')
+    texts = texts.fillna('NOTEXT')
+    labels = pd.read_csv(args.labels, names=['label'], encoding='utf-8', dtype='str')
+    vocab = pd.read_csv(args.vocab, names=['label', 'text'], sep='\t', encoding='utf-8', dtype='str')
+    hierarchy = MeSHGraph(args.hierarchy)
 
-  if args.normal:
-    word_embedding_model = models.BERT(args.path_to_bert_model)
-    pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(),
-                                 pooling_mode_mean_tokens=True,
-                                 pooling_mode_cls_token=False,
-                                 pooling_mode_max_tokens=False)
-    model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
-    vocab['embeddings'] = model.encode(vocab.text.str.lower().tolist(),batch_size=128, show_progress_bar=True)
-  data = pd.concat([texts, labels], axis=1)
-  data = pd.merge(data, vocab, left_on='label', right_on='label')
-  data = data.groupby(['entity_text', 'label']).head(args.positive_count_per_example).reset_index(drop=True)
-  prev_label = None
-  prev_text  = None
-  #tree = KDTree(np.vstack(vocab.embeddings))
-  with open(args.save_to, 'w', encoding='utf-8') as output_stream:
-    for row_idx, row in tqdm(data.iterrows(), total=data.shape[0]): #text, label in tqdm(zip(texts.text.values.tolist(), labels.label.values.tolist()), total=1700*40):
-      text = row['entity_text']
-      label = row['label']
-      positive_example = row['text']
-      if args.normal and (prev_text != text or prev_label != label):
-        text_embedding =  model.encode([text.lower()])[0]
-        negative_examples = hard_sampling(text_embedding, label, vocab, tree)
-      elif prev_text != text or prev_label != label:
-        sampling_probabilities = random_sample_probs(text, label, vocab)
-      negative_examples = sample_negative_examples(vocab, sampling_probabilities, args.negatives_count_per_example)
-      for negative_example in negative_examples:
-        # negative_example = sample_negative_examples(vocab, sampling_probabilities)
-        output_stream.write('{}\t{}\t{}\n'.format(text, positive_example, negative_example))
-      parent_labels = hierarchy.get_parents(label)
-      parent_pos_examples = vocab[vocab.label.isin(parent_labels)]['text'].tolist()
-      for _ in range(min(args.parents_sample_count, len(parent_pos_examples))): #parent_pos_examples[:args.parents_sample_count]:
-        parent_pos_example = np.random.choice(parent_pos_examples)
-        snegative_example = np.random.choice(negative_examples)
-        output_stream.write('{}\t{}\t{}\n'.format(positive_example, parent_pos_example, snegative_example))
-      prev_label = label
-      prev_text = text
+    data = pd.concat([texts, labels], axis=1)
+
+    # load model
+    if args.normal:
+        model = load_model(args.path_to_bert_model)
+
+    prev_label = None
+    prev_text = None
+    tree = KDTree(np.vstack(vocab.embeddings))
+    with open(args.save_to, 'w', encoding='utf-8') as output_stream:
+        for row_idx, row in tqdm(data.iterrows(), total=data.shape[0]):
+            entity_text = row['entity_text']
+            label = row['label']
+            entity_embedding = row['embedding']
+            order = tree.query(entity_text, k=vocab.shape[0])
+            ordered_labels = vocab.sort_values('order')[['label', 'text']].values[order].tolist()
+            positive_examples = get_positive_examples(label, args.positives_count_per_example, hierarchy,
+                                                      args.parents_sample_count, args.hard, ordered_labels)
+            negative_examples = get_negative_examples(label, args.negatives_count_per_example, hierarchy,
+                                                      args.hierarchy_aware, args.hard, ordered_labels)
+            for positive_example in positive_examples:
+                for negative_example in negative_examples:
+                    output_stream.write(f'{entity_text}\t{positive_example}\t{negative_example}\n')
+
